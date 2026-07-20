@@ -78,9 +78,14 @@ class App(tk.Tk):
 
         self._syncing = False
 
-        # セル寸法（可変）。#4 の自動フィットは未実装のため全セル一律。
+        # セル寸法。cell_w / cell_h は既定値。
+        # 個別サイズはヘッダのドラッグで設定でき、以下に上書きを保持する。
+        #   slot_ext : 整列スロット k ごとの「整列軸方向の大きさ」（左右共通＝行対応を揃える）
+        #   field_ext: シート列 c ごとの「交差軸方向の大きさ」（左右で独立）
         self.cell_w = CW
         self.cell_h = CH
+        self.slot_ext: dict[int, int] = {}
+        self.field_ext = {"left": {}, "right": {}}
         # 左右のスクロール位置を（整列軸に加えて）両軸で一致させるか
         self.sync_both = tk.BooleanVar(value=False)
 
@@ -121,6 +126,8 @@ class App(tk.Tk):
                            variable=self.show_lines, command=self.redraw_all)
         vm.add_checkbutton(label="左右のスクロール位置を一致させる",
                            variable=self.sync_both, command=self._on_sync_toggle)
+        vm.add_separator()
+        vm.add_command(label="セルの大きさを既定に戻す", command=self.reset_cell_sizes)
         m.add_cascade(label="表示", menu=vm)
 
         rm = tk.Menu(m, tearoff=0)
@@ -282,6 +289,60 @@ class App(tk.Tk):
         self.cell_w, self.cell_h = w, h
         self.redraw_all()
 
+    # ---------------------------------------------------------- 個別セルサイズ
+    def aligned_default(self) -> int:
+        """整列軸（スロット）方向の既定サイズ。"""
+        return self.cell_w if self.transposed else self.cell_h
+
+    def cross_default(self) -> int:
+        """交差軸（シート列）方向の既定サイズ。"""
+        return self.cell_h if self.transposed else self.cell_w
+
+    def slot_extent(self, k: int) -> int:
+        return self.slot_ext.get(k, self.aligned_default())
+
+    def field_extent(self, side: str, c: int) -> int:
+        return self.field_ext[side].get(c, self.cross_default())
+
+    def set_extent(self, kind: str, side: str, key: int, size: int):
+        """ドラッグ結果を反映する。slot は左右共通、field は side ごと。"""
+        size = max(14, min(600, int(size)))
+        if kind == "slot":
+            self.slot_ext[key] = size          # 左右で共通 → 行対応が揃う
+        else:
+            self.field_ext[side][key] = size
+        self.redraw_all()
+
+    def autofit(self, kind: str, side: str, key: int):
+        """境界ダブルクリックで内容に合わせて自動調整。"""
+        if kind == "field":
+            sheet = self.left_sheet if side == "left" else self.right_sheet
+            maxw = 0
+            for r in range(sheet.nrows):
+                t = sheet.text(r, key).replace("\n", " ")
+                if t:
+                    maxw = max(maxw, self._font.measure(t))
+            self.field_ext[side][key] = max(40, min(600, maxw + 14))
+        else:
+            # 行高は既定（1行）に戻す
+            self.slot_ext.pop(key, None)
+        self.redraw_all()
+
+    def reset_cell_sizes(self):
+        self.slot_ext.clear()
+        self.field_ext["left"].clear()
+        self.field_ext["right"].clear()
+        self.redraw_all()
+
+    def normal_slot_offsets(self):
+        """通常向きのスロット y 開始位置一覧と総高を返す。"""
+        offs = []
+        y = HDR_H
+        for k in range(len(self.model.pairs)):
+            offs.append(y)
+            y += self.slot_extent(k)
+        return offs, y
+
     def _on_sync_toggle(self):
         # 有効化した瞬間に、左の現在位置へ右（と中央）を合わせる
         if self.sync_both.get():
@@ -377,6 +438,10 @@ class App(tk.Tk):
             setattr(self.opts, k, var.get())
         self.model = DiffModel(self.left_sheet, self.right_sheet, self.opts)
         self.vindex = ValueIndex(self.left_sheet, self.right_sheet, self.opts)
+        # 個別サイズはファイル索引に依存するため作り直し時にクリア
+        self.slot_ext.clear()
+        self.field_ext["left"].clear()
+        self.field_ext["right"].clear()
         self.selection = None
         self.same_left.clear()
         self.same_right.clear()
@@ -418,9 +483,8 @@ class App(tk.Tk):
                 y = self.single_offsets[k] + self.single_heights[k] / 2
                 self._draw_mid_connector(c, p, y)
             return
-        n = len(self.model.pairs)
-        height = HDR_H + n * self.cell_h
-        c.configure(scrollregion=(0, 0, MID_W, max(height, 1)))
+        offs, total = self.normal_slot_offsets()
+        c.configure(scrollregion=(0, 0, MID_W, max(total, 1)))
         if self.transposed:
             c.create_text(MID_W / 2, 40, text="行列\n入替中", font=("Meiryo", 8),
                           fill="#888", justify="center")
@@ -428,7 +492,7 @@ class App(tk.Tk):
         if not self.show_lines.get():
             return
         for k, p in enumerate(self.model.pairs):
-            y = HDR_H + k * self.cell_h + self.cell_h / 2
+            y = offs[k] + self.slot_extent(k) / 2
             self._draw_mid_connector(c, p, y)
 
     def _draw_mid_connector(self, c, p, y):
@@ -642,20 +706,28 @@ class App(tk.Tk):
                 self.left_grid.canvas.yview_moveto(frac)
                 self.propagate_scroll("v", frac, self.left_grid)
             return
-        n = len(self.model.pairs)
-        ncols = (self.left_sheet.ncols if self.left_sheet else 1)
-        ch = self.cell_h
-        cw = self.cell_w
         if self.transposed:
-            total = HDR_H + max(ncols, 1) * ch
-            self.left_grid.canvas.yview_moveto(max(0, (HDR_H + col * ch) / total - 0.1))
-            self.right_grid.canvas.yview_moveto(max(0, (HDR_H + col * ch) / total - 0.1))
-            frac = (k * cw) / max(1, n * cw)
-            self.left_grid.canvas.xview_moveto(max(0, frac - 0.1))
-            self.propagate_scroll("h", max(0, frac - 0.1), self.left_grid)
+            # 縦＝シート列、横＝スロット。左側の寸法で概算スクロールする。
+            ysum = HDR_H
+            for cc in range(col):
+                ysum += self.field_extent("left", cc)
+            ytotal = HDR_H
+            for cc in range(self.left_sheet.ncols):
+                ytotal += self.field_extent("left", cc)
+            frac_y = max(0, ysum / max(ytotal, 1) - 0.1)
+            self.left_grid.canvas.yview_moveto(frac_y)
+            self.right_grid.canvas.yview_moveto(frac_y)
+            xsum = HDR_W
+            for kk in range(k):
+                xsum += self.slot_extent(kk)
+            xtotal = HDR_W + sum(self.slot_extent(kk)
+                                 for kk in range(len(self.model.pairs)))
+            frac = max(0, xsum / max(xtotal, 1) - 0.1)
+            self.left_grid.canvas.xview_moveto(frac)
+            self.propagate_scroll("h", frac, self.left_grid)
         else:
-            total = HDR_H + max(n, 1) * ch
-            frac = max(0, (HDR_H + k * ch) / total - 0.1)
+            offs, total = self.normal_slot_offsets()
+            frac = max(0, offs[k] / max(total, 1) - 0.1)
             self.left_grid.canvas.yview_moveto(frac)
             self.propagate_scroll("v", frac, self.left_grid)
 

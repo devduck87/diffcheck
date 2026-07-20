@@ -51,9 +51,20 @@ class GridView(tk.Frame):
         self.columnconfigure(0, weight=1)
 
         self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<B1-Motion>", self._on_drag_resize)
+        self.canvas.bind("<ButtonRelease-1>", self._on_end_resize)
+        self.canvas.bind("<Double-Button-1>", self._on_dbl)
+        self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", self._on_rclick)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+
+        # 行高・列幅ドラッグ用の状態と、直近レイアウトのオフセット
+        self._resize = None          # (axis, index, start_coord, start_size)
+        self._H = []                 # 横軸要素 [{kind,key,size}, ...]
+        self._V = []                 # 縦軸要素
+        self._hx = [HDR_W]           # 横境界の累積座標（len(H)+1）
+        self._vy = [HDR_H]           # 縦境界の累積座標（len(V)+1）
 
     # ----------------------------------------------------------- スクロール
     def _on_yscroll(self, lo, hi):
@@ -79,12 +90,34 @@ class GridView(tk.Frame):
     def _pair_data_row(self, pair):
         return pair.left if self.side == "left" else pair.right
 
+    def _build_axes(self):
+        """現在の向き・可変サイズに基づき、横軸(H)・縦軸(V)と累積座標を作る。
+
+        H/V の各要素は {kind:'field'|'slot', key:int, size:int}。
+        行高(slot)は左右共通、列幅(field)は side ごと。
+        """
+        app = self.app
+        pairs = app.model.pairs
+        ncols = self._sheet().ncols
+        cols = [{"kind": "field", "key": c, "size": app.field_extent(self.side, c)}
+                for c in range(ncols)]
+        slots = [{"kind": "slot", "key": k, "size": app.slot_extent(k)}
+                 for k in range(len(pairs))]
+        if app.transposed:
+            self._H, self._V = slots, cols
+        else:
+            self._H, self._V = cols, slots
+        self._hx = _accumulate(HDR_W, self._H)
+        self._vy = _accumulate(HDR_H, self._V)
+
+    def _hi_vi(self, k: int, col: int):
+        """(スロット k, 列 col) を (横index, 縦index) へ。"""
+        return (k, col) if self.app.transposed else (col, k)
+
     def _cellbox(self, k: int, col: int):
-        """(整列スロット k, シート列 col) の描画矩形 (x, y, w, h)。"""
-        cw, ch = self.app.cell_w, self.app.cell_h
-        if self.app.transposed:
-            return (HDR_W + k * cw, HDR_H + col * ch, cw, ch)
-        return (HDR_W + col * cw, HDR_H + k * ch, cw, ch)
+        hi, vi = self._hi_vi(k, col)
+        return (self._hx[hi], self._vy[vi],
+                self._H[hi]["size"], self._V[vi]["size"])
 
     def _hit(self, event):
         """クリック位置を (k, col) へ変換。範囲外は None。"""
@@ -92,13 +125,11 @@ class GridView(tk.Frame):
         cy = self.canvas.canvasy(event.y)
         if cx < HDR_W or cy < HDR_H:
             return None
-        cw, ch = self.app.cell_w, self.app.cell_h
-        if self.app.transposed:
-            k = int((cx - HDR_W) // cw)
-            col = int((cy - HDR_H) // ch)
-        else:
-            col = int((cx - HDR_W) // cw)
-            k = int((cy - HDR_H) // ch)
+        hi = _index_at(self._hx, cx)
+        vi = _index_at(self._vy, cy)
+        if hi is None or vi is None:
+            return None
+        k, col = (hi, vi) if self.app.transposed else (vi, hi)
         pairs = self.app.model.pairs
         sheet = self._sheet()
         if not (0 <= k < len(pairs)) or not (0 <= col < sheet.ncols):
@@ -132,6 +163,8 @@ class GridView(tk.Frame):
 
     # ----------------------------------------------------------- クリック
     def _on_click(self, event):
+        if self._begin_resize(event):
+            return
         if self.app.single_col:
             data = self._single_hit_data(event)
             if data is None:
@@ -173,6 +206,69 @@ class GridView(tk.Frame):
             return
         self.app.show_context_menu(self.side, dr, event.x_root, event.y_root)
 
+    # ----------------------------------------------------- 行高・列幅リサイズ
+    def _divider_at(self, cx, cy):
+        """ヘッダ上の境界線近傍か判定。('H'|'V', 要素index) または None。"""
+        if self.app.single_col:
+            return None
+        tol = 4
+        if cy < HDR_H and cx >= HDR_W:      # 上ヘッダ → 横軸(H)の境界
+            for i in range(1, len(self._hx)):
+                if abs(cx - self._hx[i]) <= tol:
+                    return ("H", i - 1)
+        if cx < HDR_W and cy >= HDR_H:      # 左ヘッダ → 縦軸(V)の境界
+            for i in range(1, len(self._vy)):
+                if abs(cy - self._vy[i]) <= tol:
+                    return ("V", i - 1)
+        return None
+
+    def _begin_resize(self, event) -> bool:
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        div = self._divider_at(cx, cy)
+        if div is None:
+            return False
+        axis, idx = div
+        elems = self._H if axis == "H" else self._V
+        start_coord = cx if axis == "H" else cy
+        self._resize = (axis, idx, start_coord, elems[idx]["size"])
+        return True
+
+    def _on_drag_resize(self, event):
+        if self._resize is None:
+            return
+        axis, idx, start_coord, start_size = self._resize
+        cur = self.canvas.canvasx(event.x) if axis == "H" else self.canvas.canvasy(event.y)
+        new_size = int(start_size + (cur - start_coord))
+        elems = self._H if axis == "H" else self._V
+        el = elems[idx]
+        self.app.set_extent(el["kind"], self.side, el["key"], new_size)
+
+    def _on_end_resize(self, _event):
+        self._resize = None
+
+    def _on_motion(self, event):
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        div = self._divider_at(cx, cy)
+        if div is None:
+            self.canvas.configure(cursor="")
+        elif div[0] == "H":
+            self.canvas.configure(cursor="sb_h_double_arrow")
+        else:
+            self.canvas.configure(cursor="sb_v_double_arrow")
+
+    def _on_dbl(self, event):
+        """境界のダブルクリックで内容に合わせて自動調整。"""
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        div = self._divider_at(cx, cy)
+        if div is None:
+            return
+        axis, idx = div
+        el = (self._H if axis == "H" else self._V)[idx]
+        self.app.autofit(el["kind"], self.side, el["key"])
+
     # ----------------------------------------------------------- 描画
     def redraw(self):
         if self.app.single_col:
@@ -186,13 +282,8 @@ class GridView(tk.Frame):
         n = len(pairs)
         ncols = sheet.ncols
 
-        cw, ch = self.app.cell_w, self.app.cell_h
-        if self.app.transposed:
-            width = HDR_W + n * cw
-            height = HDR_H + ncols * ch
-        else:
-            width = HDR_W + ncols * cw
-            height = HDR_H + n * ch
+        self._build_axes()
+        width, height = self._hx[-1], self._vy[-1]
         c.configure(scrollregion=(0, 0, max(width, 1), max(height, 1)))
 
         sel = self.app.selection
@@ -232,43 +323,32 @@ class GridView(tk.Frame):
 
         self._draw_headers(n, ncols, pairs, sheet)
 
+    def _elem_label(self, el, horizontal: bool) -> str:
+        """H/V 要素の見出し文字列。"""
+        if el["kind"] == "field":
+            return col_letter(el["key"])
+        pair = self.app.model.pairs[el["key"]]
+        dr = self._pair_data_row(pair)
+        label = str(dr + 1) if dr is not None else "-"
+        mark = self._kind_mark(pair)
+        return f"{mark}{label}行" if horizontal else f"{mark}{label}"
+
     def _draw_headers(self, n, ncols, pairs, sheet):
         c = self.canvas
-        cw, ch = self.app.cell_w, self.app.cell_h
-        if self.app.transposed:
-            # 上ヘッダ = 整列スロット（元の行番号）、左ヘッダ = 列文字
-            for k, pair in enumerate(pairs):
-                dr = self._pair_data_row(pair)
-                x = HDR_W + k * cw
-                label = str(dr + 1) if dr is not None else "-"
-                mark = self._kind_mark(pair)
-                c.create_rectangle(x, 0, x + cw, HDR_H, fill=HEADER_BG,
-                                   outline=GRID_LINE)
-                c.create_text(x + cw / 2, HDR_H / 2, text=f"{mark}{label}行",
-                              font=HFONT)
-            for col in range(ncols):
-                y = HDR_H + col * ch
-                c.create_rectangle(0, y, HDR_W, y + ch, fill=HEADER_BG,
-                                   outline=GRID_LINE)
-                c.create_text(HDR_W / 2, y + ch / 2, text=col_letter(col),
-                              font=HFONT)
-        else:
-            # 上ヘッダ = 列文字、左ヘッダ = 元の行番号
-            for col in range(ncols):
-                x = HDR_W + col * cw
-                c.create_rectangle(x, 0, x + cw, HDR_H, fill=HEADER_BG,
-                                   outline=GRID_LINE)
-                c.create_text(x + cw / 2, HDR_H / 2, text=col_letter(col),
-                              font=HFONT)
-            for k, pair in enumerate(pairs):
-                dr = self._pair_data_row(pair)
-                y = HDR_H + k * ch
-                label = str(dr + 1) if dr is not None else "-"
-                mark = self._kind_mark(pair)
-                c.create_rectangle(0, y, HDR_W, y + ch, fill=HEADER_BG,
-                                   outline=GRID_LINE)
-                c.create_text(HDR_W / 2, y + ch / 2, text=f"{mark}{label}",
-                              font=HFONT)
+        # 上ヘッダ（横軸 H）
+        for i, el in enumerate(self._H):
+            x, w = self._hx[i], el["size"]
+            c.create_rectangle(x, 0, x + w, HDR_H, fill=HEADER_BG,
+                               outline=GRID_LINE)
+            c.create_text(x + w / 2, HDR_H / 2, text=self._elem_label(el, True),
+                          font=HFONT, width=w - 2)
+        # 左ヘッダ（縦軸 V）
+        for i, el in enumerate(self._V):
+            y, h = self._vy[i], el["size"]
+            c.create_rectangle(0, y, HDR_W, y + h, fill=HEADER_BG,
+                               outline=GRID_LINE)
+            c.create_text(HDR_W / 2, y + h / 2, text=self._elem_label(el, False),
+                          font=HFONT, width=HDR_W - 2)
         # 左上コーナー
         c.create_rectangle(0, 0, HDR_W, HDR_H, fill="#dfe4ea", outline=GRID_LINE)
         c.create_text(HDR_W / 2, HDR_H / 2,
@@ -366,3 +446,27 @@ def _bg_for(state: str) -> str:
         "same": SAME_BG,
         "none": NONE_BG,
     }.get(state, SAME_BG)
+
+
+def _accumulate(start: int, elems: list) -> list:
+    """要素サイズの累積境界座標を返す（長さ len(elems)+1）。"""
+    offs = [start]
+    acc = start
+    for el in elems:
+        acc += el["size"]
+        offs.append(acc)
+    return offs
+
+
+def _index_at(offsets: list, coord: float):
+    """累積境界 offsets 上で coord が入る区間 index を返す。範囲外は None。"""
+    if coord < offsets[0] or coord >= offsets[-1]:
+        return None
+    lo, hi = 0, len(offsets) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if offsets[mid] <= coord:
+            lo = mid
+        else:
+            hi = mid
+    return lo
