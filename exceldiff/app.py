@@ -184,43 +184,64 @@ class App(tk.Tk):
         self.b_redo = btn("Redo", self.do_redo)
 
     def _build_detail_panel(self):
-        """差分一覧・左グリッド・右グリッドの上に、選択セルの値詳細を表示する帯。"""
-        p = tk.Frame(self, bd=1, relief="sunken", height=66)
+        """差分一覧・左グリッド・右グリッドの上に、選択セルの値詳細を表示する帯。
+
+        値が長い場合に備え、左右の値はスクロール可能な Text で表示する。
+        """
+        p = tk.Frame(self, bd=1, relief="sunken", height=110)
         p.pack(side="top", fill="x")
         p.pack_propagate(False)
 
-        # 差分一覧の上：見出しと選択セル情報
+        # 差分一覧の上：見出しと選択セル情報（スクロール可能）
         info = tk.Frame(p, width=230)
         info.pack(side="left", fill="y")
         info.pack_propagate(False)
         tk.Label(info, text="セル詳細", bg="#dfe4ea", anchor="w").pack(fill="x")
-        self.detail_addr = tk.Label(info, text="セル未選択", anchor="nw",
-                                    justify="left", font=("Meiryo", 9))
-        self.detail_addr.pack(fill="both", expand=True, padx=4)
+        self.detail_addr = self._make_scroll_text(info)
 
-        # 左グリッドの上：左の値（全文）
+        # 左グリッドの上：左の値（全文・スクロール可能）
         lf = tk.Frame(p)
         lf.pack(side="left", fill="both", expand=True)
         tk.Label(lf, text="左の値", bg="#eef1f5", anchor="w").pack(fill="x")
-        self.detail_left = tk.Label(lf, text="", anchor="nw", justify="left",
-                                    font=("Meiryo", 9), wraplength=1)
-        self.detail_left.pack(fill="both", expand=True, padx=4)
+        self.detail_left = self._make_scroll_text(lf)
 
         # 中央（対応列）の上：スペーサ
         tk.Frame(p, width=MID_W).pack(side="left", fill="y")
 
-        # 右グリッドの上：右の値（全文）
+        # 右グリッドの上：右の値（全文・スクロール可能）
         rf = tk.Frame(p)
         rf.pack(side="left", fill="both", expand=True)
         tk.Label(rf, text="右の値", bg="#eef1f5", anchor="w").pack(fill="x")
-        self.detail_right = tk.Label(rf, text="", anchor="nw", justify="left",
-                                     font=("Meiryo", 9), wraplength=1)
-        self.detail_right.pack(fill="both", expand=True, padx=4)
+        self.detail_right = self._make_scroll_text(rf)
 
-        # 幅に合わせて折り返し長を追従させる
-        for lb in (self.detail_left, self.detail_right):
-            lb.bind("<Configure>",
-                    lambda e, w=lb: w.config(wraplength=max(1, e.width - 8)))
+        self._clear_detail()
+
+    def _make_scroll_text(self, parent) -> tk.Text:
+        """縦スクロールバー付きの読み取り専用 Text を作って返す。"""
+        wrap = tk.Frame(parent)
+        wrap.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(wrap, orient="vertical")
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(wrap, wrap="word", font=("Meiryo", 9), height=1,
+                      bd=0, padx=4, pady=2, background="white",
+                      yscrollcommand=sb.set, state="disabled",
+                      cursor="arrow")
+        txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt.yview)
+        # ホイールでスクロール（フォーカス不要でホバー中に効かせる）
+        txt.bind("<MouseWheel>",
+                 lambda e, t=txt: (t.yview_scroll(-1 if e.delta > 0 else 1,
+                                                  "units"), "break")[1])
+        return txt
+
+    @staticmethod
+    def _set_text(widget: tk.Text, text: str):
+        widget.config(state="normal")
+        widget.delete("1.0", tk.END)
+        if text:
+            widget.insert("1.0", text)
+        widget.config(state="disabled")
+        widget.yview_moveto(0)
 
     def _update_detail(self, side, r, c):
         """選択セルと同じ整列行の左右の値を詳細帯に表示する。"""
@@ -236,17 +257,17 @@ class App(tk.Tk):
                 if lr is not None and c < self.left_sheet.ncols else "")
         rval = (self.right_sheet.text(rr, c)
                 if rr is not None and c < self.right_sheet.ncols else "")
-        self.detail_addr.config(
-            text=f"列：{self._col_label(c)}\n"
-                 f"選択：{side} {cell_address(r, c)}")
-        self.detail_left.config(text=lval)
-        self.detail_right.config(text=rval)
+        self._set_text(self.detail_addr,
+                       f"列：{self._col_label(c)}\n"
+                       f"選択：{side} {cell_address(r, c)}")
+        self._set_text(self.detail_left, lval)
+        self._set_text(self.detail_right, rval)
 
     def _clear_detail(self):
         if hasattr(self, "detail_addr"):
-            self.detail_addr.config(text="セル未選択")
-            self.detail_left.config(text="")
-            self.detail_right.config(text="")
+            self._set_text(self.detail_addr, "セル未選択")
+            self._set_text(self.detail_left, "")
+            self._set_text(self.detail_right, "")
 
     def _on_cell_size(self, *_):
         try:
