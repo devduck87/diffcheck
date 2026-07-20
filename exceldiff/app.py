@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import reader
 from .diffengine import DiffModel
-from .gridview import GridView, CH, HDR_H, GRID_LINE, SINGLE_CW, SINGLE_PAD
+from .gridview import GridView, CW, CH, HDR_H, GRID_LINE, SINGLE_CW, SINGLE_PAD
 from .model import Sheet, cell_address, col_letter
 from .normalize import NormalizeOptions
 from .valueindex import ValueIndex
@@ -78,8 +78,15 @@ class App(tk.Tk):
 
         self._syncing = False
 
+        # セル寸法（可変）。#4 の自動フィットは未実装のため全セル一律。
+        self.cell_w = CW
+        self.cell_h = CH
+        # 左右のスクロール位置を（整列軸に加えて）両軸で一致させるか
+        self.sync_both = tk.BooleanVar(value=False)
+
         self._build_menu()
         self._build_toolbar()
+        self._build_detail_panel()
         self._build_body()
         self._build_rowedit_panel()
         self._build_statusbar()
@@ -112,6 +119,8 @@ class App(tk.Tk):
                            command=self.on_highlight_toggle)
         vm.add_checkbutton(label="行対応関係を線で表示する",
                            variable=self.show_lines, command=self.redraw_all)
+        vm.add_checkbutton(label="左右のスクロール位置を一致させる",
+                           variable=self.sync_both, command=self._on_sync_toggle)
         m.add_cascade(label="表示", menu=vm)
 
         rm = tk.Menu(m, tearoff=0)
@@ -150,6 +159,22 @@ class App(tk.Tk):
         self.b_colnext = btn("列▶", lambda: self.step_column(1))
         self.b_highlight = btn("同一値強調", self.toggle_highlight_btn)
         tk.Frame(bar, width=2, bg="#bbb").pack(side="left", fill="y", padx=4)
+        tk.Label(bar, text="幅").pack(side="left")
+        self.sp_w = tk.Spinbox(bar, from_=40, to=400, width=4, increment=4,
+                               command=self._on_cell_size)
+        self.sp_w.delete(0, "end")
+        self.sp_w.insert(0, str(self.cell_w))
+        self.sp_w.pack(side="left", padx=(0, 4))
+        tk.Label(bar, text="高").pack(side="left")
+        self.sp_h = tk.Spinbox(bar, from_=14, to=200, width=4, increment=2,
+                               command=self._on_cell_size)
+        self.sp_h.delete(0, "end")
+        self.sp_h.insert(0, str(self.cell_h))
+        self.sp_h.pack(side="left", padx=(0, 2))
+        for sp in (self.sp_w, self.sp_h):
+            sp.bind("<Return>", self._on_cell_size)
+            sp.bind("<FocusOut>", self._on_cell_size)
+        tk.Frame(bar, width=2, bg="#bbb").pack(side="left", fill="y", padx=4)
         self.b_mode = btn("行対応編集", self.toggle_mode)
         self.b_pair = btn("対応付け", self.do_pair)
         self.b_unpair = btn("対応解除", self.do_unpair)
@@ -157,6 +182,118 @@ class App(tk.Tk):
         tk.Frame(bar, width=2, bg="#bbb").pack(side="left", fill="y", padx=4)
         self.b_undo = btn("Undo", self.do_undo)
         self.b_redo = btn("Redo", self.do_redo)
+
+    def _build_detail_panel(self):
+        """差分一覧・左グリッド・右グリッドの上に、選択セルの値詳細を表示する帯。
+
+        値が長い場合に備え、左右の値はスクロール可能な Text で表示する。
+        """
+        p = tk.Frame(self, bd=1, relief="sunken", height=110)
+        p.pack(side="top", fill="x")
+        p.pack_propagate(False)
+
+        # 差分一覧の上：見出しと選択セル情報（スクロール可能）
+        info = tk.Frame(p, width=230)
+        info.pack(side="left", fill="y")
+        info.pack_propagate(False)
+        tk.Label(info, text="セル詳細", bg="#dfe4ea", anchor="w").pack(fill="x")
+        self.detail_addr = self._make_scroll_text(info)
+
+        # 左グリッドの上：左の値（全文・スクロール可能）
+        lf = tk.Frame(p)
+        lf.pack(side="left", fill="both", expand=True)
+        tk.Label(lf, text="左の値", bg="#eef1f5", anchor="w").pack(fill="x")
+        self.detail_left = self._make_scroll_text(lf)
+
+        # 中央（対応列）の上：スペーサ
+        tk.Frame(p, width=MID_W).pack(side="left", fill="y")
+
+        # 右グリッドの上：右の値（全文・スクロール可能）
+        rf = tk.Frame(p)
+        rf.pack(side="left", fill="both", expand=True)
+        tk.Label(rf, text="右の値", bg="#eef1f5", anchor="w").pack(fill="x")
+        self.detail_right = self._make_scroll_text(rf)
+
+        self._clear_detail()
+
+    def _make_scroll_text(self, parent) -> tk.Text:
+        """縦スクロールバー付きの読み取り専用 Text を作って返す。"""
+        wrap = tk.Frame(parent)
+        wrap.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(wrap, orient="vertical")
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(wrap, wrap="word", font=("Meiryo", 9), height=1,
+                      bd=0, padx=4, pady=2, background="white",
+                      yscrollcommand=sb.set, state="disabled",
+                      cursor="arrow")
+        txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt.yview)
+        # ホイールでスクロール（フォーカス不要でホバー中に効かせる）
+        txt.bind("<MouseWheel>",
+                 lambda e, t=txt: (t.yview_scroll(-1 if e.delta > 0 else 1,
+                                                  "units"), "break")[1])
+        return txt
+
+    @staticmethod
+    def _set_text(widget: tk.Text, text: str):
+        widget.config(state="normal")
+        widget.delete("1.0", tk.END)
+        if text:
+            widget.insert("1.0", text)
+        widget.config(state="disabled")
+        widget.yview_moveto(0)
+
+    def _update_detail(self, side, r, c):
+        """選択セルと同じ整列行の左右の値を詳細帯に表示する。"""
+        if not self.model:
+            return
+        lr = rr = None
+        for p in self.model.pairs:
+            dr = p.left if side == "left" else p.right
+            if dr == r:
+                lr, rr = p.left, p.right
+                break
+        lval = (self.left_sheet.text(lr, c)
+                if lr is not None and c < self.left_sheet.ncols else "")
+        rval = (self.right_sheet.text(rr, c)
+                if rr is not None and c < self.right_sheet.ncols else "")
+        self._set_text(self.detail_addr,
+                       f"列：{self._col_label(c)}\n"
+                       f"選択：{side} {cell_address(r, c)}")
+        self._set_text(self.detail_left, lval)
+        self._set_text(self.detail_right, rval)
+
+    def _clear_detail(self):
+        if hasattr(self, "detail_addr"):
+            self._set_text(self.detail_addr, "セル未選択")
+            self._set_text(self.detail_left, "")
+            self._set_text(self.detail_right, "")
+
+    def _on_cell_size(self, *_):
+        try:
+            w = int(self.sp_w.get())
+            h = int(self.sp_h.get())
+        except (ValueError, TypeError):
+            return
+        w = max(40, min(400, w))
+        h = max(14, min(200, h))
+        if (w, h) == (self.cell_w, self.cell_h):
+            return
+        self.cell_w, self.cell_h = w, h
+        self.redraw_all()
+
+    def _on_sync_toggle(self):
+        # 有効化した瞬間に、左の現在位置へ右（と中央）を合わせる
+        if self.sync_both.get():
+            self.propagate_scroll("h", self.left_grid.canvas.xview()[0],
+                                  self.left_grid)
+            self.propagate_scroll("v", self.left_grid.canvas.yview()[0],
+                                  self.left_grid)
+
+    def should_sync(self, axis: str) -> bool:
+        if self.sync_both.get():
+            return True
+        return self.aligned_axis() == axis
 
     def _build_body(self):
         body = tk.Frame(self)
@@ -244,6 +381,7 @@ class App(tk.Tk):
         self.same_left.clear()
         self.same_right.clear()
         self.left_sel_row = self.right_sel_row = None
+        self._clear_detail()
         self._rebuild_difflist()
         self.redraw_all()
         self._update_summary()
@@ -281,7 +419,7 @@ class App(tk.Tk):
                 self._draw_mid_connector(c, p, y)
             return
         n = len(self.model.pairs)
-        height = HDR_H + n * CH
+        height = HDR_H + n * self.cell_h
         c.configure(scrollregion=(0, 0, MID_W, max(height, 1)))
         if self.transposed:
             c.create_text(MID_W / 2, 40, text="行列\n入替中", font=("Meiryo", 8),
@@ -290,7 +428,7 @@ class App(tk.Tk):
         if not self.show_lines.get():
             return
         for k, p in enumerate(self.model.pairs):
-            y = HDR_H + k * CH + CH / 2
+            y = HDR_H + k * self.cell_h + self.cell_h / 2
             self._draw_mid_connector(c, p, y)
 
     def _draw_mid_connector(self, c, p, y):
@@ -506,16 +644,18 @@ class App(tk.Tk):
             return
         n = len(self.model.pairs)
         ncols = (self.left_sheet.ncols if self.left_sheet else 1)
+        ch = self.cell_h
+        cw = self.cell_w
         if self.transposed:
-            total = HDR_H + max(ncols, 1) * CH
-            self.left_grid.canvas.yview_moveto(max(0, (HDR_H + col * CH) / total - 0.1))
-            self.right_grid.canvas.yview_moveto(max(0, (HDR_H + col * CH) / total - 0.1))
-            frac = (k * 96) / max(1, n * 96)
+            total = HDR_H + max(ncols, 1) * ch
+            self.left_grid.canvas.yview_moveto(max(0, (HDR_H + col * ch) / total - 0.1))
+            self.right_grid.canvas.yview_moveto(max(0, (HDR_H + col * ch) / total - 0.1))
+            frac = (k * cw) / max(1, n * cw)
             self.left_grid.canvas.xview_moveto(max(0, frac - 0.1))
             self.propagate_scroll("h", max(0, frac - 0.1), self.left_grid)
         else:
-            total = HDR_H + max(n, 1) * CH
-            frac = max(0, (HDR_H + k * CH) / total - 0.1)
+            total = HDR_H + max(n, 1) * ch
+            frac = max(0, (HDR_H + k * ch) / total - 0.1)
             self.left_grid.canvas.yview_moveto(frac)
             self.propagate_scroll("v", frac, self.left_grid)
 
@@ -524,6 +664,7 @@ class App(tk.Tk):
         self.selection = (side, r, c)
         self._update_same_value(side, r, c)
         self._update_cell_status(side, r, c)
+        self._update_detail(side, r, c)
         self.redraw_all()
 
     def _update_same_value(self, side, r, c):

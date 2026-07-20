@@ -58,15 +58,13 @@ class GridView(tk.Frame):
     # ----------------------------------------------------------- スクロール
     def _on_yscroll(self, lo, hi):
         self.vbar.set(lo, hi)
-        axis = "v"
-        if self.app.aligned_axis() == axis:
-            self.app.propagate_scroll(axis, lo, self)
+        if self.app.should_sync("v"):
+            self.app.propagate_scroll("v", lo, self)
 
     def _on_xscroll(self, lo, hi):
         self.hbar.set(lo, hi)
-        axis = "h"
-        if self.app.aligned_axis() == axis:
-            self.app.propagate_scroll(axis, lo, self)
+        if self.app.should_sync("h"):
+            self.app.propagate_scroll("h", lo, self)
 
     def _on_wheel(self, event):
         self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
@@ -83,9 +81,10 @@ class GridView(tk.Frame):
 
     def _cellbox(self, k: int, col: int):
         """(整列スロット k, シート列 col) の描画矩形 (x, y, w, h)。"""
+        cw, ch = self.app.cell_w, self.app.cell_h
         if self.app.transposed:
-            return (HDR_W + k * CW, HDR_H + col * CH, CW, CH)
-        return (HDR_W + col * CW, HDR_H + k * CH, CW, CH)
+            return (HDR_W + k * cw, HDR_H + col * ch, cw, ch)
+        return (HDR_W + col * cw, HDR_H + k * ch, cw, ch)
 
     def _hit(self, event):
         """クリック位置を (k, col) へ変換。範囲外は None。"""
@@ -93,12 +92,13 @@ class GridView(tk.Frame):
         cy = self.canvas.canvasy(event.y)
         if cx < HDR_W or cy < HDR_H:
             return None
+        cw, ch = self.app.cell_w, self.app.cell_h
         if self.app.transposed:
-            k = int((cx - HDR_W) // CW)
-            col = int((cy - HDR_H) // CH)
+            k = int((cx - HDR_W) // cw)
+            col = int((cy - HDR_H) // ch)
         else:
-            col = int((cx - HDR_W) // CW)
-            k = int((cy - HDR_H) // CH)
+            col = int((cx - HDR_W) // cw)
+            k = int((cy - HDR_H) // ch)
         pairs = self.app.model.pairs
         sheet = self._sheet()
         if not (0 <= k < len(pairs)) or not (0 <= col < sheet.ncols):
@@ -186,12 +186,13 @@ class GridView(tk.Frame):
         n = len(pairs)
         ncols = sheet.ncols
 
+        cw, ch = self.app.cell_w, self.app.cell_h
         if self.app.transposed:
-            width = HDR_W + n * CW
-            height = HDR_H + ncols * CH
+            width = HDR_W + n * cw
+            height = HDR_H + ncols * ch
         else:
-            width = HDR_W + ncols * CW
-            height = HDR_H + n * CH
+            width = HDR_W + ncols * cw
+            height = HDR_H + n * ch
         c.configure(scrollregion=(0, 0, max(width, 1), max(height, 1)))
 
         sel = self.app.selection
@@ -215,8 +216,10 @@ class GridView(tk.Frame):
                 if dr is not None and state != "none":
                     text = sheet.text(dr, col)
                     if text:
-                        c.create_text(x + 4, y + h / 2, anchor="w", text=text,
-                                      font=FONT, width=w - 6)
+                        # 上揃え・1行に切り詰めてセル境界からはみ出させない
+                        disp = self._fit_text(text, w - 8)
+                        c.create_text(x + 4, y + 3, anchor="nw", text=disp,
+                                      font=FONT)
                 # 同一値ハイライト（枠線）
                 if dr is not None and (dr, col) in same:
                     c.create_rectangle(x + 1, y + 1, x + w - 1, y + h - 1,
@@ -231,39 +234,40 @@ class GridView(tk.Frame):
 
     def _draw_headers(self, n, ncols, pairs, sheet):
         c = self.canvas
+        cw, ch = self.app.cell_w, self.app.cell_h
         if self.app.transposed:
             # 上ヘッダ = 整列スロット（元の行番号）、左ヘッダ = 列文字
             for k, pair in enumerate(pairs):
                 dr = self._pair_data_row(pair)
-                x = HDR_W + k * CW
+                x = HDR_W + k * cw
                 label = str(dr + 1) if dr is not None else "-"
                 mark = self._kind_mark(pair)
-                c.create_rectangle(x, 0, x + CW, HDR_H, fill=HEADER_BG,
+                c.create_rectangle(x, 0, x + cw, HDR_H, fill=HEADER_BG,
                                    outline=GRID_LINE)
-                c.create_text(x + CW / 2, HDR_H / 2, text=f"{mark}{label}行",
+                c.create_text(x + cw / 2, HDR_H / 2, text=f"{mark}{label}行",
                               font=HFONT)
             for col in range(ncols):
-                y = HDR_H + col * CH
-                c.create_rectangle(0, y, HDR_W, y + CH, fill=HEADER_BG,
+                y = HDR_H + col * ch
+                c.create_rectangle(0, y, HDR_W, y + ch, fill=HEADER_BG,
                                    outline=GRID_LINE)
-                c.create_text(HDR_W / 2, y + CH / 2, text=col_letter(col),
+                c.create_text(HDR_W / 2, y + ch / 2, text=col_letter(col),
                               font=HFONT)
         else:
             # 上ヘッダ = 列文字、左ヘッダ = 元の行番号
             for col in range(ncols):
-                x = HDR_W + col * CW
-                c.create_rectangle(x, 0, x + CW, HDR_H, fill=HEADER_BG,
+                x = HDR_W + col * cw
+                c.create_rectangle(x, 0, x + cw, HDR_H, fill=HEADER_BG,
                                    outline=GRID_LINE)
-                c.create_text(x + CW / 2, HDR_H / 2, text=col_letter(col),
+                c.create_text(x + cw / 2, HDR_H / 2, text=col_letter(col),
                               font=HFONT)
             for k, pair in enumerate(pairs):
                 dr = self._pair_data_row(pair)
-                y = HDR_H + k * CH
+                y = HDR_H + k * ch
                 label = str(dr + 1) if dr is not None else "-"
                 mark = self._kind_mark(pair)
-                c.create_rectangle(0, y, HDR_W, y + CH, fill=HEADER_BG,
+                c.create_rectangle(0, y, HDR_W, y + ch, fill=HEADER_BG,
                                    outline=GRID_LINE)
-                c.create_text(HDR_W / 2, y + CH / 2, text=f"{mark}{label}",
+                c.create_text(HDR_W / 2, y + ch / 2, text=f"{mark}{label}",
                               font=HFONT)
         # 左上コーナー
         c.create_rectangle(0, 0, HDR_W, HDR_H, fill="#dfe4ea", outline=GRID_LINE)
@@ -275,6 +279,26 @@ class GridView(tk.Frame):
         if pair.manual and pair.left is not None and pair.right is not None:
             return "🔗"
         return ""
+
+    def _fit_text(self, text: str, max_w: int) -> str:
+        """セル幅 max_w に収まる1行へ切り詰める（超過分は末尾を…に）。"""
+        text = text.replace("\n", " ")
+        f = self.app._font
+        if max_w <= 0:
+            return ""
+        if f.measure(text) <= max_w:
+            return text
+        ell = "…"
+        ew = f.measure(ell)
+        out = []
+        w = 0
+        for chn in text:
+            cwn = f.measure(chn)
+            if w + cwn + ew > max_w:
+                break
+            out.append(chn)
+            w += cwn
+        return "".join(out) + ell
 
     # ----------------------------------------------------------- 1列表示 描画
     def _redraw_single(self):
