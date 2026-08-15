@@ -408,7 +408,7 @@ class App(tk.Tk):
     def open_file(self, side: str):
         path = filedialog.askopenfilename(
             title=f"{side} ファイルを開く",
-            filetypes=[("Excel/CSV", "*.xlsx *.csv *.tsv *.txt"), ("すべて", "*.*")])
+            filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.csv *.tsv *.txt"), ("すべて", "*.*")])
         if not path:
             return
         try:
