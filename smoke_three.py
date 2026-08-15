@@ -1,8 +1,14 @@
 """3ファイル比較（A/B/C）をウィンドウ非表示で検証する。"""
 
 import os
+import sys
 
 from exceldiff.app import App
+
+# 差分一覧には「↔」など cp932 に無い記号が含まれるため、
+# Windows の既定コンソール（cp932）でも落ちないよう UTF-8 で出力する。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 base = os.path.join(os.path.dirname(__file__), "sample_data")
 paths = [os.path.join(base, n) for n in ("left.xlsx", "right.xlsx", "third.xlsx")]
