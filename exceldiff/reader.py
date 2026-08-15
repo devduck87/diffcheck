@@ -1,6 +1,8 @@
-"""Excel(.xlsx) / CSV 読込。標準ライブラリのみ。
+"""Excel(.xlsx / .xlsm) / CSV 読込。標準ライブラリのみ。
 
-.xlsx は zip + XML なので zipfile と xml.etree で解析する（openpyxl 不使用）。
+.xlsx / .xlsm は zip + XML なので zipfile と xml.etree で解析する（openpyxl 不使用）。
+.xlsm はマクロを含むだけで中身の構造は .xlsx と同じなので同じパーサで読む
+（マクロ本体 vbaProject.bin は比較対象外）。
 数値書式（表示形式）は解釈せず、内部値をそのまま表示する簡易実装。
 """
 
@@ -21,7 +23,7 @@ def _local(tag: str) -> str:
 
 def load(path: str) -> Workbook:
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".xlsx":
+    if ext in (".xlsx", ".xlsm"):
         return _load_xlsx(path)
     if ext in (".csv", ".txt", ".tsv"):
         return _load_csv(path, "\t" if ext == ".tsv" else ",")

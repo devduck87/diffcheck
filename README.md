@@ -3,7 +3,8 @@
 Python **標準ライブラリのみ**で実装した Excel 差分比較ツールです。
 外部パッケージ（openpyxl 等）は使用していません。
 
-* `.xlsx` は `zipfile` + `xml.etree` で自作パーサにより読み込みます
+* `.xlsx` / `.xlsm` は `zipfile` + `xml.etree` で自作パーサにより読み込みます
+  （`.xlsm` はマクロ付き形式ですが中身の構造は `.xlsx` と同じ。シート値のみ比較し、マクロは対象外）
 * GUI は `tkinter`（Canvas）
 * 行整列は `difflib.SequenceMatcher`
 * 正規化は `unicodedata`（NFKC で全角・半角同一視）
@@ -17,7 +18,7 @@ py make_samples.py
 # サンプルで起動
 py run.py --sample
 
-# 任意の2ファイルで起動（.xlsx / .csv / .tsv）
+# 任意の2ファイルで起動（.xlsx / .xlsm / .csv / .tsv）
 py run.py left.xlsx right.xlsx
 
 # 空で起動し、[ファイル]メニューから開く
@@ -140,7 +141,7 @@ diffcheck2/
 └─ exceldiff/
    ├─ model.py            Cell / Sheet / Workbook, アドレス変換
    ├─ normalize.py        値の正規化（一致条件）
-   ├─ reader.py           .xlsx / .csv 読込
+   ├─ reader.py           .xlsx / .xlsm / .csv 読込
    ├─ diffengine.py       行整列・セル比較・手動対応・Undo/Redo
    ├─ valueindex.py       同一値インデックス
    ├─ gridview.py         Canvas グリッド（転置・色・ハイライト）
