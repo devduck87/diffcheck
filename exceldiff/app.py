@@ -4,6 +4,9 @@
   * 行列入れ替え表示（左右同時）
   * 同一値セルハイライト
   * 手動での行対応修正（Undo/Redo 対応）
+
+比較対象は2ファイル（A/B）が基本で、3つ目（C）を開くと3ファイル比較になる。
+行の整列は常に A を基準とし、A↔B と A↔C の結果を1本に統合して並べる。
 """
 
 from __future__ import annotations
@@ -16,12 +19,14 @@ from tkinter import filedialog, messagebox, ttk
 from . import reader
 from .diffengine import DiffModel
 from .gridview import GridView, CW, CH, HDR_H, GRID_LINE, SINGLE_CW, SINGLE_PAD
-from .model import Sheet, cell_address, col_letter
+from .model import (SIDES, SIDE_LABELS, Sheet, cell_address, col_letter,
+                    side_index)
 from .normalize import NormalizeOptions
 from .valueindex import ValueIndex
 
 MID_W = 66
 MAX_HIGHLIGHT = 100  # 同一値ハイライトの上限（仕様 3.9）
+OPEN_TYPES = [("Excel/CSV", "*.xlsx *.xlsm *.csv *.tsv *.txt"), ("すべて", "*.*")]
 
 # 1列表示モードの行ヘッダ幅
 SINGLE_HDR_W_NORMAL = 52   # 通常向き＝元の行番号
@@ -35,10 +40,11 @@ class App(tk.Tk):
         self.geometry("1280x760")
 
         # --- 状態 -----------------------------------------------------------
-        self.left_sheet: Sheet | None = None
-        self.right_sheet: Sheet | None = None
-        self.left_wb = None
-        self.right_wb = None
+        # 比較パネルは最大3つ。SIDES = ("left","right","third") をキーに持つ。
+        # "third" は未読込なら None で、その場合は従来どおり2ファイル比較。
+        self.wbs: dict = {s: None for s in SIDES}
+        self.sheets: dict = {s: None for s in SIDES}
+        self.npanes = 2               # 実際に比較しているファイル数（2 または 3）
         self.model: DiffModel | None = None
         self.vindex: ValueIndex | None = None
 
@@ -58,10 +64,8 @@ class App(tk.Tk):
         self._wrap_px = SINGLE_CW - 2 * SINGLE_PAD
 
         self.selection = None  # (side, r, c)
-        self.same_left: set = set()
-        self.same_right: set = set()
-        self.left_sel_row = None
-        self.right_sel_row = None
+        self.same: dict = {s: set() for s in SIDES}      # 同一値セル（パネル別）
+        self.sel_rows: dict = {s: None for s in SIDES}   # 行対応編集の選択行
         self._same_nav: list = []   # 同一値移動用
         self._same_nav_i = -1
 
@@ -80,12 +84,13 @@ class App(tk.Tk):
 
         # セル寸法。cell_w / cell_h は既定値。
         # 個別サイズはヘッダのドラッグで設定でき、以下に上書きを保持する。
-        #   slot_ext : 整列スロット k ごとの「整列軸方向の大きさ」（左右共通＝行対応を揃える）
-        #   field_ext: シート列 c ごとの「交差軸方向の大きさ」（左右で独立）
+        #   slot_ext : 整列スロット k ごとの「整列軸方向の大きさ」
+        #              （全パネル共通＝行対応が揃う）
+        #   field_ext: シート列 c ごとの「交差軸方向の大きさ」（パネルごとに独立）
         self.cell_w = CW
         self.cell_h = CH
         self.slot_ext: dict[int, int] = {}
-        self.field_ext = {"left": {}, "right": {}}
+        self.field_ext = {s: {} for s in SIDES}
         # 左右のスクロール位置を（整列軸に加えて）両軸で一致させるか
         self.sync_both = tk.BooleanVar(value=False)
 
@@ -98,14 +103,76 @@ class App(tk.Tk):
 
         self._refresh_buttons()
 
+    # ============================================================= パネル共通
+    def active_sides(self) -> list[str]:
+        """比較中のパネルキー一覧（2ファイルなら left/right の2つ）。"""
+        return list(SIDES[:self.npanes])
+
+    def sheet_of(self, side) -> Sheet | None:
+        return self.sheets[SIDES[side_index(side)]]
+
+    def active_sheets(self) -> list[Sheet]:
+        return [self.sheets[s] for s in self.active_sides()]
+
+    def base_grid(self) -> GridView:
+        """基準パネル（A）のグリッド。スクロール基準に使う。"""
+        return self.grids["left"]
+
+    def max_ncols(self) -> int:
+        return max((sh.ncols for sh in self.active_sheets() if sh), default=0)
+
+    # 2ファイル時代からの別名（外部スクリプト互換）
+    @property
+    def left_sheet(self):
+        return self.sheets["left"]
+
+    @property
+    def right_sheet(self):
+        return self.sheets["right"]
+
+    @property
+    def third_sheet(self):
+        return self.sheets["third"]
+
+    @property
+    def same_left(self):
+        return self.same["left"]
+
+    @property
+    def same_right(self):
+        return self.same["right"]
+
+    @property
+    def left_sel_row(self):
+        return self.sel_rows["left"]
+
+    @property
+    def right_sel_row(self):
+        return self.sel_rows["right"]
+
+    @property
+    def left_grid(self):
+        return self.grids["left"]
+
+    @property
+    def right_grid(self):
+        return self.grids["right"]
+
     # ================================================================= UI構築
     def _build_menu(self):
         m = tk.Menu(self)
         self.config(menu=m)
 
         fm = tk.Menu(m, tearoff=0)
-        fm.add_command(label="左ファイルを開く...", command=lambda: self.open_file("left"))
-        fm.add_command(label="右ファイルを開く...", command=lambda: self.open_file("right"))
+        fm.add_command(label="ファイルA（基準）を開く...",
+                       command=lambda: self.open_file("left"))
+        fm.add_command(label="ファイルB を開く...",
+                       command=lambda: self.open_file("right"))
+        fm.add_command(label="ファイルC を開く...（3ファイル比較）",
+                       command=lambda: self.open_file("third"))
+        fm.add_separator()
+        fm.add_command(label="ファイルC を閉じる（2ファイル比較に戻す）",
+                       command=self.close_third)
         fm.add_separator()
         fm.add_command(label="終了", command=self.destroy)
         m.add_cascade(label="ファイル", menu=fm)
@@ -124,7 +191,7 @@ class App(tk.Tk):
                            command=self.on_highlight_toggle)
         vm.add_checkbutton(label="行対応関係を線で表示する",
                            variable=self.show_lines, command=self.redraw_all)
-        vm.add_checkbutton(label="左右のスクロール位置を一致させる",
+        vm.add_checkbutton(label="各パネルのスクロール位置を一致させる",
                            variable=self.sync_both, command=self._on_sync_toggle)
         vm.add_separator()
         vm.add_command(label="セルの大きさを既定に戻す", command=self.reset_cell_sizes)
@@ -189,15 +256,19 @@ class App(tk.Tk):
         tk.Frame(bar, width=2, bg="#bbb").pack(side="left", fill="y", padx=4)
         self.b_undo = btn("Undo", self.do_undo)
         self.b_redo = btn("Redo", self.do_redo)
+        tk.Frame(bar, width=2, bg="#bbb").pack(side="left", fill="y", padx=4)
+        self.b_third = btn("＋Cファイル", self.toggle_third)
 
     def _build_detail_panel(self):
-        """差分一覧・左グリッド・右グリッドの上に、選択セルの値詳細を表示する帯。
+        """各グリッドの上に、選択セルと同じ整列行の値を並べて表示する帯。
 
-        値が長い場合に備え、左右の値はスクロール可能な Text で表示する。
+        値が長い場合に備え、各パネルの値はスクロール可能な Text で表示する。
+        パネルCの枠は3ファイル比較のときだけ表示する（配置順は最後）。
         """
         p = tk.Frame(self, bd=1, relief="sunken", height=110)
         p.pack(side="top", fill="x")
         p.pack_propagate(False)
+        self._detail_bar = p
 
         # 差分一覧の上：見出しと選択セル情報（スクロール可能）
         info = tk.Frame(p, width=230)
@@ -206,20 +277,26 @@ class App(tk.Tk):
         tk.Label(info, text="セル詳細", bg="#dfe4ea", anchor="w").pack(fill="x")
         self.detail_addr = self._make_scroll_text(info)
 
-        # 左グリッドの上：左の値（全文・スクロール可能）
-        lf = tk.Frame(p)
-        lf.pack(side="left", fill="both", expand=True)
-        tk.Label(lf, text="左の値", bg="#eef1f5", anchor="w").pack(fill="x")
-        self.detail_left = self._make_scroll_text(lf)
+        # 各グリッドの上：そのパネルの値（全文・スクロール可能）
+        self.detail_vals: dict = {}
+        self._detail_frames: dict = {}
+        self._detail_spacers: dict = {}
+        for s in SIDES:
+            if s != "left":
+                # 対応列（中央キャンバス）の上のスペーサ
+                sp = tk.Frame(p, width=MID_W)
+                sp.pack(side="left", fill="y")
+                self._detail_spacers[s] = sp
+            f = tk.Frame(p)
+            f.pack(side="left", fill="both", expand=True)
+            tk.Label(f, text=f"{SIDE_LABELS[s]} の値", bg="#eef1f5",
+                     anchor="w").pack(fill="x")
+            self.detail_vals[s] = self._make_scroll_text(f)
+            self._detail_frames[s] = f
 
-        # 中央（対応列）の上：スペーサ
-        tk.Frame(p, width=MID_W).pack(side="left", fill="y")
-
-        # 右グリッドの上：右の値（全文・スクロール可能）
-        rf = tk.Frame(p)
-        rf.pack(side="left", fill="both", expand=True)
-        tk.Label(rf, text="右の値", bg="#eef1f5", anchor="w").pack(fill="x")
-        self.detail_right = self._make_scroll_text(rf)
+        # 2ファイル比較の間はパネルCの枠を隠す
+        self._detail_frames["third"].pack_forget()
+        self._detail_spacers["third"].pack_forget()
 
         self._clear_detail()
 
@@ -251,30 +328,26 @@ class App(tk.Tk):
         widget.yview_moveto(0)
 
     def _update_detail(self, side, r, c):
-        """選択セルと同じ整列行の左右の値を詳細帯に表示する。"""
+        """選択セルと同じ整列行の各パネルの値を詳細帯に表示する。"""
         if not self.model:
             return
-        lr = rr = None
-        for p in self.model.pairs:
-            dr = p.left if side == "left" else p.right
-            if dr == r:
-                lr, rr = p.left, p.right
-                break
-        lval = (self.left_sheet.text(lr, c)
-                if lr is not None and c < self.left_sheet.ncols else "")
-        rval = (self.right_sheet.text(rr, c)
-                if rr is not None and c < self.right_sheet.ncols else "")
+        k = self.model.slot_of(side, r)
+        slot = self.model.pairs[k] if k is not None else None
+        for s in self.active_sides():
+            sheet = self.sheets[s]
+            dr = slot.row(s) if slot is not None else None
+            val = (sheet.text(dr, c)
+                   if dr is not None and sheet and c < sheet.ncols else "")
+            self._set_text(self.detail_vals[s], val)
         self._set_text(self.detail_addr,
                        f"列：{self._col_label(c)}\n"
-                       f"選択：{side} {cell_address(r, c)}")
-        self._set_text(self.detail_left, lval)
-        self._set_text(self.detail_right, rval)
+                       f"選択：{SIDE_LABELS[side]} {cell_address(r, c)}")
 
     def _clear_detail(self):
         if hasattr(self, "detail_addr"):
             self._set_text(self.detail_addr, "セル未選択")
-            self._set_text(self.detail_left, "")
-            self._set_text(self.detail_right, "")
+            for s in SIDES:
+                self._set_text(self.detail_vals[s], "")
 
     def _on_cell_size(self, *_):
         try:
@@ -305,10 +378,10 @@ class App(tk.Tk):
         return self.field_ext[side].get(c, self.cross_default())
 
     def set_extent(self, kind: str, side: str, key: int, size: int):
-        """ドラッグ結果を反映する。slot は左右共通、field は side ごと。"""
+        """ドラッグ結果を反映する。slot は全パネル共通、field は side ごと。"""
         size = max(14, min(600, int(size)))
         if kind == "slot":
-            self.slot_ext[key] = size          # 左右で共通 → 行対応が揃う
+            self.slot_ext[key] = size          # 全パネル共通 → 行対応が揃う
         else:
             self.field_ext[side][key] = size
         self.redraw_all()
@@ -316,7 +389,7 @@ class App(tk.Tk):
     def autofit(self, kind: str, side: str, key: int):
         """境界ダブルクリックで内容に合わせて自動調整。"""
         if kind == "field":
-            sheet = self.left_sheet if side == "left" else self.right_sheet
+            sheet = self.sheets[side]
             maxw = 0
             for r in range(sheet.nrows):
                 t = sheet.text(r, key).replace("\n", " ")
@@ -330,8 +403,8 @@ class App(tk.Tk):
 
     def reset_cell_sizes(self):
         self.slot_ext.clear()
-        self.field_ext["left"].clear()
-        self.field_ext["right"].clear()
+        for s in SIDES:
+            self.field_ext[s].clear()
         self.redraw_all()
 
     def normal_slot_offsets(self):
@@ -344,12 +417,11 @@ class App(tk.Tk):
         return offs, y
 
     def _on_sync_toggle(self):
-        # 有効化した瞬間に、左の現在位置へ右（と中央）を合わせる
+        # 有効化した瞬間に、基準パネル(A)の現在位置へ他パネル（と中央）を合わせる
         if self.sync_both.get():
-            self.propagate_scroll("h", self.left_grid.canvas.xview()[0],
-                                  self.left_grid)
-            self.propagate_scroll("v", self.left_grid.canvas.yview()[0],
-                                  self.left_grid)
+            g = self.base_grid()
+            self.propagate_scroll("h", g.canvas.xview()[0], g)
+            self.propagate_scroll("v", g.canvas.yview()[0], g)
 
     def should_sync(self, axis: str) -> bool:
         if self.sync_both.get():
@@ -370,18 +442,24 @@ class App(tk.Tk):
         self.difflist.pack(fill="both", expand=True)
         self.difflist.bind("<<ListboxSelect>>", self._on_difflist_select)
 
-        # 左グリッド
-        self.left_grid = GridView(body, self, "left")
-        self.left_grid.pack(side="left", fill="both", expand=True)
-
-        # 中央（対応関係）
-        self.mid = tk.Canvas(body, width=MID_W, background="#f7f8fa",
-                             highlightthickness=0)
-        self.mid.pack(side="left", fill="y")
-
-        # 右グリッド
-        self.right_grid = GridView(body, self, "right")
-        self.right_grid.pack(side="left", fill="both", expand=True)
+        # グリッドと、その間の対応関係キャンバスを A|B|C の順に並べる。
+        # パネルCとその手前のキャンバスは配置順の最後なので、3ファイル比較に
+        # なった時点で pack すれば右端に追加される。
+        self.grids: dict = {}
+        self.mids: dict = {}   # キー: 右側パネル（"right" は A|B、"third" は B|C）
+        for s in SIDES:
+            if s != "left":
+                mid = tk.Canvas(body, width=MID_W, background="#f7f8fa",
+                                highlightthickness=0)
+                mid.pack(side="left", fill="y")
+                self.mids[s] = mid
+            g = GridView(body, self, s)
+            g.pack(side="left", fill="both", expand=True)
+            self.grids[s] = g
+        self.grids["third"].pack_forget()
+        self.mids["third"].pack_forget()
+        # 2ファイル時代の別名
+        self.mid = self.mids["right"]
 
     def _build_rowedit_panel(self):
         p = tk.Frame(self, bd=1, relief="sunken")
@@ -397,9 +475,9 @@ class App(tk.Tk):
         sb.pack(side="bottom", fill="x")
         self.status_cell = tk.Label(sb, text="元セル：-", width=22, anchor="w")
         self.status_cell.pack(side="left", padx=4)
-        self.status_same = tk.Label(sb, text="同一値：-", width=24, anchor="w")
+        self.status_same = tk.Label(sb, text="同一値：-", width=32, anchor="w")
         self.status_same.pack(side="left", padx=4)
-        self.status_map = tk.Label(sb, text="対応：-", width=24, anchor="w")
+        self.status_map = tk.Label(sb, text="対応：-", width=26, anchor="w")
         self.status_map.pack(side="left", padx=4)
         self.status_sum = tk.Label(sb, text="集計：-", anchor="w")
         self.status_sum.pack(side="left", padx=4)
@@ -407,8 +485,7 @@ class App(tk.Tk):
     # ================================================================= ファイル
     def open_file(self, side: str):
         path = filedialog.askopenfilename(
-            title=f"{side} ファイルを開く",
-            filetypes=[("Excel/CSV", "*.xlsx *.xlsm *.csv *.tsv *.txt"), ("すべて", "*.*")])
+            title=f"ファイル{SIDE_LABELS[side]} を開く", filetypes=OPEN_TYPES)
         if not path:
             return
         try:
@@ -416,36 +493,79 @@ class App(tk.Tk):
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("読込エラー", f"{os.path.basename(path)}\n{e}")
             return
-        sheet = wb.sheets[0]
-        if side == "left":
-            self.left_wb, self.left_sheet = wb, sheet
-        else:
-            self.right_wb, self.right_sheet = wb, sheet
-        if self.left_sheet and self.right_sheet:
+        self.wbs[side] = wb
+        self.sheets[side] = wb.sheets[0]
+        if self.sheets["left"] and self.sheets["right"]:
             self.recompare()
 
-    def load_pair(self, left_path: str, right_path: str):
-        self.left_wb = reader.load(left_path)
-        self.right_wb = reader.load(right_path)
-        self.left_sheet = self.left_wb.sheets[0]
-        self.right_sheet = self.right_wb.sheets[0]
+    def toggle_third(self):
+        """3ファイル比較の追加／解除をトグルする（ツールバー用）。"""
+        if self.sheets["third"]:
+            self.close_third()
+        else:
+            self.open_file("third")
+
+    def close_third(self):
+        """3つ目のファイルを外し、2ファイル比較へ戻す。"""
+        if not self.sheets["third"]:
+            return
+        self.wbs["third"] = None
+        self.sheets["third"] = None
+        if self.sheets["left"] and self.sheets["right"]:
+            self.recompare()
+        else:
+            self.npanes = 2
+            self._apply_pane_visibility()
+
+    def load_pair(self, left_path: str, right_path: str, third_path: str = None):
+        """A/B（必要なら C）を読み込んで比較する。"""
+        paths = [left_path, right_path] + ([third_path] if third_path else [])
+        self.load_files(*paths)
+
+    def load_files(self, *paths: str):
+        if not 2 <= len(paths) <= len(SIDES):
+            raise ValueError(f"比較できるのは2〜{len(SIDES)}ファイルです。")
+        for s in SIDES:
+            self.wbs[s] = None
+            self.sheets[s] = None
+        for s, path in zip(SIDES, paths):
+            self.wbs[s] = reader.load(path)
+            self.sheets[s] = self.wbs[s].sheets[0]
         self.recompare()
 
+    def _apply_pane_visibility(self):
+        """パネルC（グリッド・対応列・詳細帯）の表示/非表示を切り替える。"""
+        show = self.npanes >= 3
+        packed = bool(self.grids["third"].winfo_manager())
+        if show and not packed:
+            self.mids["third"].pack(side="left", fill="y")
+            self.grids["third"].pack(side="left", fill="both", expand=True)
+            self._detail_spacers["third"].pack(side="left", fill="y")
+            self._detail_frames["third"].pack(side="left", fill="both",
+                                              expand=True)
+        elif not show and packed:
+            self.mids["third"].pack_forget()
+            self.grids["third"].pack_forget()
+            self._detail_spacers["third"].pack_forget()
+            self._detail_frames["third"].pack_forget()
+
     def recompare(self):
-        if not (self.left_sheet and self.right_sheet):
+        if not (self.sheets["left"] and self.sheets["right"]):
             return
         for k, var in self._num_opts.items():
             setattr(self.opts, k, var.get())
-        self.model = DiffModel(self.left_sheet, self.right_sheet, self.opts)
-        self.vindex = ValueIndex(self.left_sheet, self.right_sheet, self.opts)
+        self.npanes = 3 if self.sheets["third"] else 2
+        self._apply_pane_visibility()
+        sheets = self.active_sheets()
+        self.model = DiffModel(sheets, self.opts)
+        self.vindex = ValueIndex(sheets, self.opts)
         # 個別サイズはファイル索引に依存するため作り直し時にクリア
         self.slot_ext.clear()
-        self.field_ext["left"].clear()
-        self.field_ext["right"].clear()
+        for s in SIDES:
+            self.field_ext[s].clear()
+            self.same[s].clear()
+            self.sel_rows[s] = None
         self.selection = None
-        self.same_left.clear()
-        self.same_right.clear()
-        self.left_sel_row = self.right_sel_row = None
         self._clear_detail()
         self._rebuild_difflist()
         self.redraw_all()
@@ -458,15 +578,21 @@ class App(tk.Tk):
             return
         if self.single_col:
             self.build_single_layout()
-        self.left_grid.redraw()
-        self.right_grid.redraw()
+        for s in self.active_sides():
+            self.grids[s].redraw()
         self._draw_mid()
 
     def _draw_mid(self):
-        c = self.mid
+        """各パネルの間の対応関係キャンバスを描く。"""
+        for s in self.active_sides()[1:]:
+            self._draw_mid_canvas(self.mids[s], side_index(s))
+
+    def _draw_mid_canvas(self, c, right_pane: int):
+        """right_pane と その左隣（right_pane - 1）の対応を描く。"""
         c.delete("all")
         if not self.model:
             return
+        left_pane = right_pane - 1
         # 1列表示（通常向き）では可変高で対応線を描く。転置1列は1レコードなので省略。
         if self.single_col:
             if self.transposed:
@@ -481,7 +607,7 @@ class App(tk.Tk):
                 if k >= len(self.single_offsets):
                     break
                 y = self.single_offsets[k] + self.single_heights[k] / 2
-                self._draw_mid_connector(c, p, y)
+                self._draw_mid_connector(c, p, y, left_pane, right_pane)
             return
         offs, total = self.normal_slot_offsets()
         c.configure(scrollregion=(0, 0, MID_W, max(total, 1)))
@@ -493,19 +619,20 @@ class App(tk.Tk):
             return
         for k, p in enumerate(self.model.pairs):
             y = offs[k] + self.slot_extent(k) / 2
-            self._draw_mid_connector(c, p, y)
+            self._draw_mid_connector(c, p, y, left_pane, right_pane)
 
-    def _draw_mid_connector(self, c, p, y):
-        if p.left is not None and p.right is not None:
+    def _draw_mid_connector(self, c, p, y, left_pane=0, right_pane=1):
+        lrow, rrow = p.row(left_pane), p.row(right_pane)
+        if lrow is not None and rrow is not None:
             if p.manual:
                 c.create_line(4, y, MID_W - 4, y, fill="#1a73e8", width=3)
                 c.create_text(MID_W / 2, y - 7, text="🔗", font=("Meiryo", 7))
             else:
                 c.create_line(6, y, MID_W - 6, y, fill="#9aa0a6", width=1)
-        elif p.left is not None:
+        elif lrow is not None:
             c.create_text(MID_W / 2, y, text="◀削除", font=("Meiryo", 7),
                           fill="#c0392b")
-        else:
+        elif rrow is not None:
             c.create_text(MID_W / 2, y, text="追加▶", font=("Meiryo", 7),
                           fill="#1e824c")
 
@@ -513,14 +640,14 @@ class App(tk.Tk):
     def _single_ndisp(self) -> int:
         """1列表示の表示行数（現在の向きの行軸）。"""
         if self.transposed:
-            return max(self.left_sheet.ncols, self.right_sheet.ncols)
+            return self.max_ncols()
         return len(self.model.pairs)
 
     def single_cols_count(self) -> int:
         """1列表示で選択できる列の総数（現在の向きの列軸）。"""
         if self.transposed:
             return len(self.model.pairs)
-        return max(self.left_sheet.ncols, self.right_sheet.ncols)
+        return self.max_ncols()
 
     def single_cell(self, side: str, i: int):
         """表示行 i の (pair, data_row, col, state, text) を返す。範囲外は None。"""
@@ -536,10 +663,11 @@ class App(tk.Tk):
                 return None
             pair = pairs[i]
             col = j0
-        dr = pair.left if side == "left" else pair.right
+        dr = pair.row(side)
         state = self.model.cell_state(side, pair, col)
-        sheet = self.left_sheet if side == "left" else self.right_sheet
-        text = sheet.text(dr, col) if (dr is not None and col < sheet.ncols) else ""
+        sheet = self.sheets[side]
+        text = (sheet.text(dr, col)
+                if (dr is not None and sheet and col < sheet.ncols) else "")
         return (pair, dr, col, state, text)
 
     def _wrap_lines(self, text: str) -> int:
@@ -564,7 +692,7 @@ class App(tk.Tk):
         return total
 
     def build_single_layout(self):
-        """左右で共通の可変行高を計算し、対応行を揃える。"""
+        """全パネル共通の可変行高を計算し、対応行を揃える。"""
         self.single_offsets = []
         self.single_heights = []
         self.single_total = 0
@@ -577,12 +705,13 @@ class App(tk.Tk):
             self.single_index = max(0, min(self.single_index, cc - 1))
         y = HDR_H
         min_h = self._line_h + SINGLE_PAD
+        sides = self.active_sides()
         for i in range(nd):
-            lt = self.single_cell("left", i)
-            rt = self.single_cell("right", i)
-            ll = self._wrap_lines(lt[4]) if lt else 1
-            rl = self._wrap_lines(rt[4]) if rt else 1
-            lines = max(ll, rl, 1)
+            lines = 1
+            for s in sides:
+                info = self.single_cell(s, i)
+                if info:
+                    lines = max(lines, self._wrap_lines(info[4]))
             h = max(min_h, lines * self._line_h + SINGLE_PAD)
             self.single_offsets.append(y)
             self.single_heights.append(h)
@@ -599,9 +728,12 @@ class App(tk.Tk):
             # 列＝1つの整列スロット（1レコード）
             if 0 <= j0 < len(self.model.pairs):
                 p = self.model.pairs[j0]
-                lt = f"左{p.left + 1}" if p.left is not None else "左-"
-                rt = f"右{p.right + 1}" if p.right is not None else "右-"
-                return f"{lt} / {rt} 行"
+                parts = []
+                for s in self.active_sides():
+                    dr = p.row(s)
+                    parts.append(f"{SIDE_LABELS[s]}"
+                                 f"{dr + 1 if dr is not None else '-'}")
+                return " / ".join(parts) + " 行"
             return "-"
         # 列＝1つのフィールド。見出し行があれば列名を使う。
         name = self.left_sheet.text(0, j0) if self.left_sheet.nrows > 0 else ""
@@ -613,14 +745,13 @@ class App(tk.Tk):
             # 行＝フィールド。見出し行の値を使う。
             name = self.left_sheet.text(0, i) if self.left_sheet.nrows > 0 else ""
             return name or col_letter(i)
-        # 行＝整列スロット（元の行番号）。左右で異なるので side ごとに出す方が正確だが
-        # 中央寄せの簡易表示として左優先→なければ右。
+        # 行＝整列スロット（元の行番号）。パネルごとに異なるので side ごとに
+        # 出す方が正確だが、簡易表示として存在する先頭パネルの行番号を出す。
         if 0 <= i < len(self.model.pairs):
             p = self.model.pairs[i]
-            if p.left is not None:
-                return str(p.left + 1)
-            if p.right is not None:
-                return str(p.right + 1)
+            present = p.present()
+            if present:
+                return str(p.rows[present[0]] + 1)
         return "-"
 
     # ---------------------------------------------------------- 1列表示 操作
@@ -641,10 +772,9 @@ class App(tk.Tk):
         if self.selection:
             side, r, c = self.selection
             if self.transposed:
-                for k, p in enumerate(self.model.pairs):
-                    dr = p.left if side == "left" else p.right
-                    if dr == r:
-                        return k
+                k = self.model.slot_of(side, r)
+                if k is not None:
+                    return k
             else:
                 return c
         return 0
@@ -682,9 +812,10 @@ class App(tk.Tk):
         self._syncing = True
         try:
             src_canvas = getattr(source, "canvas", source)
-            targets = [self.left_grid.canvas, self.right_grid.canvas]
+            sides = self.active_sides()
+            targets = [self.grids[s].canvas for s in sides]
             if axis == "v":
-                targets.append(self.mid)
+                targets.extend(self.mids[s] for s in sides[1:])
             for t in targets:
                 if t is src_canvas:
                     continue
@@ -698,16 +829,17 @@ class App(tk.Tk):
     def _ensure_visible(self, k: int, col: int):
         if not self.model:
             return
+        base = self.base_grid()
         if self.single_col:
             # 表示行 i を割り出して縦位置へスクロール
             i = k if not self.transposed else col
             if 0 <= i < len(self.single_offsets) and self.single_total > 0:
                 frac = max(0, self.single_offsets[i] / self.single_total - 0.05)
-                self.left_grid.canvas.yview_moveto(frac)
-                self.propagate_scroll("v", frac, self.left_grid)
+                base.canvas.yview_moveto(frac)
+                self.propagate_scroll("v", frac, base)
             return
         if self.transposed:
-            # 縦＝シート列、横＝スロット。左側の寸法で概算スクロールする。
+            # 縦＝シート列、横＝スロット。基準パネルの寸法で概算スクロールする。
             ysum = HDR_H
             for cc in range(col):
                 ysum += self.field_extent("left", cc)
@@ -715,21 +847,21 @@ class App(tk.Tk):
             for cc in range(self.left_sheet.ncols):
                 ytotal += self.field_extent("left", cc)
             frac_y = max(0, ysum / max(ytotal, 1) - 0.1)
-            self.left_grid.canvas.yview_moveto(frac_y)
-            self.right_grid.canvas.yview_moveto(frac_y)
+            for s in self.active_sides():
+                self.grids[s].canvas.yview_moveto(frac_y)
             xsum = HDR_W
             for kk in range(k):
                 xsum += self.slot_extent(kk)
             xtotal = HDR_W + sum(self.slot_extent(kk)
                                  for kk in range(len(self.model.pairs)))
             frac = max(0, xsum / max(xtotal, 1) - 0.1)
-            self.left_grid.canvas.xview_moveto(frac)
-            self.propagate_scroll("h", frac, self.left_grid)
+            base.canvas.xview_moveto(frac)
+            self.propagate_scroll("h", frac, base)
         else:
             offs, total = self.normal_slot_offsets()
             frac = max(0, offs[k] / max(total, 1) - 0.1)
-            self.left_grid.canvas.yview_moveto(frac)
-            self.propagate_scroll("v", frac, self.left_grid)
+            base.canvas.yview_moveto(frac)
+            self.propagate_scroll("v", frac, base)
 
     # ================================================================= 選択
     def on_cell_select(self, side: str, r: int, c: int):
@@ -740,51 +872,64 @@ class App(tk.Tk):
         self.redraw_all()
 
     def _update_same_value(self, side, r, c):
-        self.same_left.clear()
-        self.same_right.clear()
+        for s in SIDES:
+            self.same[s].clear()
         self._same_nav = []
         self._same_nav_i = -1
         if not self.highlight_enabled.get() or not self.vindex:
             self.status_same.config(text="同一値：-")
             return
-        sheet = self.left_sheet if side == "left" else self.right_sheet
+        sheet = self.sheets[side]
         cell = sheet.cell(r, c)
         key = self.model.cell_key(side, r, c)
         if cell.is_blank() or key == "":
             self.status_same.config(text="同一値：空白は対象外")
             return
-        lc, rc = self.vindex.find(key)
-        total = len(lc) + len(rc)
+        sides = self.active_sides()
+        found = self.vindex.find(key)
+        # 表示上限（仕様 3.9）。先頭のパネルから順に埋める。
         capped = ""
-        if total > MAX_HIGHLIGHT:
+        if sum(len(f) for f in found) > MAX_HIGHLIGHT:
             keep = MAX_HIGHLIGHT
-            lc2 = lc[: max(0, min(len(lc), keep))]
-            rc2 = rc[: max(0, keep - len(lc2))]
-            lc, rc = lc2, rc2
+            trimmed = []
+            for cells in found:
+                take = cells[:max(0, keep)]
+                keep -= len(take)
+                trimmed.append(take)
+            found = trimmed
             capped = f"（先頭{MAX_HIGHLIGHT}件を表示）"
-        self.same_left = set(lc)
-        self.same_right = set(rc)
-        self._same_nav = ([("left", *p) for p in lc] + [("right", *p) for p in rc])
-        self.status_same.config(text=f"同一値：左{len(lc)}件 右{len(rc)}件{capped}")
+        for s, cells in zip(sides, found):
+            self.same[s] = set(cells)
+            self._same_nav.extend((s, *p) for p in cells)
+        counts = "　".join(f"{SIDE_LABELS[s]}{len(f)}件"
+                           for s, f in zip(sides, found))
+        self.status_same.config(text=f"同一値：{counts}{capped}")
 
     def _update_cell_status(self, side, r, c):
-        self.status_cell.config(text=f"元セル：{cell_address(r, c)}（{side}）")
+        self.status_cell.config(
+            text=f"元セル：{SIDE_LABELS[side]} {cell_address(r, c)}")
 
     # ================================================================= 行対応編集
     def on_row_select(self, side: str, dr: int):
-        if side == "left":
-            self.left_sel_row = dr
-        else:
-            self.right_sel_row = dr
+        self.sel_rows[side] = dr
         self._update_rowedit_label()
         self.redraw_all()
 
+    def _selected_rows(self) -> list[tuple[str, int]]:
+        """行対応編集で選択中の (パネル, 行) 一覧（表示順）。"""
+        return [(s, self.sel_rows[s]) for s in self.active_sides()
+                if self.sel_rows[s] is not None]
+
     def _update_rowedit_label(self):
-        lt = f"{self.left_sel_row + 1}行目" if self.left_sel_row is not None else "-"
-        rt = f"{self.right_sel_row + 1}行目" if self.right_sel_row is not None else "-"
+        parts = []
+        for s in self.active_sides():
+            dr = self.sel_rows[s]
+            parts.append(f"{SIDE_LABELS[s]}選択行："
+                         f"{dr + 1 if dr is not None else '-'}"
+                         + ("行目" if dr is not None else ""))
         self.rowedit_label.config(
-            text=f"行対応編集モード｜左選択行：{lt}　右選択行：{rt}"
-                 f"　→［対応付け］で左右を対応させます")
+            text="行対応編集モード｜" + "　".join(parts)
+                 + "　→［対応付け］で同じ行として対応させます")
 
     def do_pair(self):
         if not self.model:
@@ -797,24 +942,33 @@ class App(tk.Tk):
                 "行列入れ替え中",
                 "行列入れ替え表示中は行対応を編集できません。\n通常表示へ戻してください。")
             return
-        L, R = self.left_sel_row, self.right_sel_row
-        if L is None or R is None:
+        sel = self._selected_rows()
+        if len(sel) < 2:
             messagebox.showwarning(
                 "選択不足",
-                "左行または右行が選択されていません。\n左右から1行ずつ選択してください。")
+                "行が2つ以上選択されていません。\n"
+                "対応させたいパネルから1行ずつ選択してください。")
             return
-        if self.model.is_paired(L, R):
+        anchor_side, anchor_row = sel[0]
+        targets = [(s, r) for s, r in sel[1:]
+                   if not self.model.is_paired(anchor_side, anchor_row, s, r)]
+        if not targets:
             messagebox.showinfo("行対応", "選択した行はすでに対応付けられています。")
             return
-        partner = self.model.existing_partner_of_right(R)
-        if partner is not None and partner != L:
-            ok = messagebox.askyesno(
-                "対応の競合",
-                f"右{R + 1}行目は、すでに左{partner + 1}行目と対応付けられています。\n\n"
-                f"既存の対応を解除して、左{L + 1}行目と対応付けますか？")
-            if not ok:
-                return
-        self.model.manual_pair(L, R)
+        for s, r in targets:
+            partner = self.model.partner_of(s, r, anchor_side)
+            if partner is not None and partner != anchor_row:
+                ok = messagebox.askyesno(
+                    "対応の競合",
+                    f"{SIDE_LABELS[s]}{r + 1}行目は、すでに "
+                    f"{SIDE_LABELS[anchor_side]}{partner + 1}行目と"
+                    f"対応付けられています。\n\n"
+                    f"既存の対応を解除して、"
+                    f"{SIDE_LABELS[anchor_side]}{anchor_row + 1}行目と"
+                    f"対応付けますか？")
+                if not ok:
+                    continue
+            self.model.manual_pair(anchor_side, anchor_row, s, r)
         self._after_map_change()
 
     def do_unpair(self):
@@ -823,12 +977,12 @@ class App(tk.Tk):
         if self.mode != "rowedit":
             messagebox.showinfo("行対応編集", "「行対応編集」モードに切り替えてください。")
             return
-        L = self.left_sel_row
-        R = self.right_sel_row
-        if L is None and R is None:
+        sel = self._selected_rows()
+        if not sel:
             messagebox.showwarning("選択不足", "解除する行を選択してください。")
             return
-        self.model.unpair(L=L, R=R)
+        side, row = sel[0]
+        self.model.unpair(side, row)
         self._after_map_change()
 
     def do_restore_auto(self):
@@ -838,6 +992,10 @@ class App(tk.Tk):
                                "手動対応をすべて破棄し、自動対応へ戻しますか？"):
             self.model.restore_auto_all()
             self._after_map_change()
+
+    def _clear_row_sel(self):
+        for s in SIDES:
+            self.sel_rows[s] = None
 
     def _after_map_change(self):
         self._rebuild_difflist()
@@ -860,7 +1018,7 @@ class App(tk.Tk):
         else:
             self.mode = "normal"
             self.b_mode.config(relief="raised", text="行対応編集")
-            self.left_sel_row = self.right_sel_row = None
+            self._clear_row_sel()
             self.rowedit_label.config(
                 text="通常モード：セルを選択すると詳細・同一値を表示します。")
         self.redraw_all()
@@ -875,7 +1033,7 @@ class App(tk.Tk):
         if self.mode == "rowedit":
             self.mode = "normal"
             self.b_mode.config(relief="raised", text="行対応編集")
-            self.left_sel_row = self.right_sel_row = None
+            self._clear_row_sel()
         self.transposed = not self.transposed
         self.b_transpose.config(relief="sunken" if self.transposed else "raised")
         # 選択セルは (side,r,c) 不変なので維持される
@@ -904,8 +1062,8 @@ class App(tk.Tk):
         if self.selection and self.mode == "normal":
             self._update_same_value(*self.selection)
         else:
-            self.same_left.clear()
-            self.same_right.clear()
+            for s in SIDES:
+                self.same[s].clear()
 
     # ================================================================= 差分移動
     def goto_diff(self, direction: int):
@@ -926,22 +1084,19 @@ class App(tk.Tk):
         if not self.selection or not self.model:
             return -1
         side, r, c = self.selection
-        for k, p in enumerate(self.model.pairs):
-            dr = p.left if side == "left" else p.right
-            if dr == r:
-                return k
-        return -1
+        k = self.model.slot_of(side, r)
+        return -1 if k is None else k
 
     def _select_slot(self, k: int):
+        """スロット k の代表セル（存在する先頭パネルの変更列）を選択する。"""
         p = self.model.pairs[k]
-        if p.left is not None and p.right is not None:
-            col = min(p.changed_cols) if p.changed_cols else 0
-            self.on_cell_select("left", p.left, col)
-        elif p.left is not None:
-            self.on_cell_select("left", p.left, 0)
-        else:
-            self.on_cell_select("right", p.right, 0)
-        self._ensure_visible(k, 0)
+        present = p.present()
+        if not present:
+            return
+        i = present[0]
+        col = min(p.changed_cols) if p.changed_cols else 0
+        self.on_cell_select(SIDES[i], p.rows[i], col)
+        self._ensure_visible(k, col if self.transposed else 0)
         self._select_difflist_for_slot(k)
 
     # ================================================================= Undo/Redo
@@ -961,17 +1116,23 @@ class App(tk.Tk):
         self._difflist_slots = []
         if not self.model:
             return
+        sides = self.active_sides()
         for k, p in enumerate(self.model.pairs):
             if p.status == "equal":
                 continue
-            if p.status == "changed":
+            # 各パネルの行番号（無いパネルは "-"）
+            where = "↔".join(
+                f"{SIDE_LABELS[s]}"
+                f"{p.row(s) + 1 if p.row(s) is not None else '-'}"
+                for s in sides)
+            if p.changed_cols:
                 cols = "、".join(self._col_label(c) for c in sorted(p.changed_cols))
                 tag = "🔗変更" if p.manual else "変更"
-                txt = f"{tag} 左{p.left + 1}↔右{p.right + 1}（{cols}）"
-            elif p.status == "left_only":
-                txt = f"行削除 左{p.left + 1}"
+                txt = f"{tag} {where}（{cols}）"
+            elif p.rows[0] is None:
+                txt = f"行追加 {where}"
             else:
-                txt = f"行追加 右{p.right + 1}"
+                txt = f"行削除 {where}"
             self.difflist.insert(tk.END, txt)
             self._difflist_slots.append(k)
 
@@ -1003,13 +1164,10 @@ class App(tk.Tk):
         if self.mode != "rowedit":
             return
         menu = tk.Menu(self, tearoff=0)
-        if side == "left":
-            self.left_sel_row = dr
-        else:
-            self.right_sel_row = dr
+        self.sel_rows[side] = dr
         self._update_rowedit_label()
         self.redraw_all()
-        menu.add_command(label="選択した左右の行を対応付ける", command=self.do_pair)
+        menu.add_command(label="選択した行どうしを対応付ける", command=self.do_pair)
         menu.add_command(label="行対応を解除する", command=self.do_unpair)
         menu.add_command(label="自動対応に戻す（全体）", command=self.do_restore_auto)
         menu.tk_popup(x_root, y_root)
@@ -1019,9 +1177,11 @@ class App(tk.Tk):
         if not self.model:
             return
         s = self.model.summary()
+        files = f"{self.npanes}ファイル比較"
         self.status_sum.config(
-            text=f"集計：追加{s['added']} 削除{s['removed']} 変更{s['changed']} "
-                 f"変更セル{s['changed_cells']} 手動対応{s['manual']}")
+            text=f"集計（{files}）：追加{s['added']} 削除{s['removed']} "
+                 f"変更{s['changed']} 変更セル{s['changed_cells']} "
+                 f"手動対応{s['manual']}")
         if self.single_col:
             self._update_single_status()
         elif s["manual"]:
@@ -1046,13 +1206,15 @@ class App(tk.Tk):
         rowedit = self.mode == "rowedit"
         for b in (self.b_pair, self.b_unpair):
             b.config(state="normal" if has and rowedit else "disabled")
+        self.b_third.config(
+            text="Cを閉じる" if self.sheets["third"] else "＋Cファイル")
 
 
-def main(left=None, right=None):
+def main(left=None, right=None, third=None):
     app = App()
     if left and right:
         try:
-            app.load_pair(left, right)
+            app.load_pair(left, right, third)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("読込エラー", str(e))
     app.mainloop()
@@ -1061,4 +1223,5 @@ def main(left=None, right=None):
 if __name__ == "__main__":
     import sys
     a = sys.argv[1:]
-    main(a[0] if len(a) > 0 else None, a[1] if len(a) > 1 else None)
+    main(a[0] if len(a) > 0 else None, a[1] if len(a) > 1 else None,
+         a[2] if len(a) > 2 else None)

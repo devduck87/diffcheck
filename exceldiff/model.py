@@ -3,6 +3,23 @@
 from __future__ import annotations
 
 
+# 比較パネル（最大3ファイル）。先頭 "left" が基準ファイル。
+# 内部キーは 2 ファイル時代の名前を引き継ぎ、画面表示は A / B / C を使う。
+SIDES = ("left", "right", "third")
+SIDE_LABELS = {"left": "A", "right": "B", "third": "C"}
+
+
+def side_index(side) -> int:
+    """パネルキー（"left" 等）または index を index へ正規化する。"""
+    if isinstance(side, str):
+        return SIDES.index(side)
+    return int(side)
+
+
+def side_label(side) -> str:
+    return SIDE_LABELS[SIDES[side_index(side)]]
+
+
 def col_letter(index: int) -> str:
     """0始まりの列番号を Excel の列文字（A, B, ..., Z, AA ...）へ変換する。"""
     if index < 0:

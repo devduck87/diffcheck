@@ -1,14 +1,14 @@
 """Canvas ベースの Excel 風グリッド表示。
 
 行列入れ替え（転置）、差分色、同一値ハイライト、選択、行対応編集の
-行選択表示に対応する。左右で1つずつ生成される。
+行選択表示に対応する。比較パネル（最大3つ）ごとに1つ生成される。
 """
 
 from __future__ import annotations
 
 import tkinter as tk
 
-from .model import col_letter
+from .model import SIDE_LABELS, col_letter, side_index
 
 CW = 96      # セル幅
 CH = 22      # セル高
@@ -35,7 +35,8 @@ class GridView(tk.Frame):
     def __init__(self, parent, app, side: str):
         super().__init__(parent)
         self.app = app
-        self.side = side  # "left" / "right"
+        self.side = side          # "left" / "right" / "third"
+        self.pane = side_index(side)
 
         self.canvas = tk.Canvas(self, background="white", highlightthickness=0)
         self.vbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -85,16 +86,16 @@ class GridView(tk.Frame):
 
     # ----------------------------------------------------------- 座標変換
     def _sheet(self):
-        return self.app.left_sheet if self.side == "left" else self.app.right_sheet
+        return self.app.sheets[self.side]
 
     def _pair_data_row(self, pair):
-        return pair.left if self.side == "left" else pair.right
+        return pair.row(self.pane)
 
     def _build_axes(self):
         """現在の向き・可変サイズに基づき、横軸(H)・縦軸(V)と累積座標を作る。
 
         H/V の各要素は {kind:'field'|'slot', key:int, size:int}。
-        行高(slot)は左右共通、列幅(field)は side ごと。
+        行高(slot)は全パネル共通、列幅(field)は side ごと。
         """
         app = self.app
         pairs = app.model.pairs
@@ -287,9 +288,8 @@ class GridView(tk.Frame):
         c.configure(scrollregion=(0, 0, max(width, 1), max(height, 1)))
 
         sel = self.app.selection
-        same = self.app.same_left if self.side == "left" else self.app.same_right
-        rowsel = (self.app.left_sel_row if self.side == "left"
-                  else self.app.right_sel_row)
+        same = self.app.same[self.side]
+        rowsel = self.app.sel_rows[self.side]
 
         # セル本体
         for k, pair in enumerate(pairs):
@@ -351,12 +351,12 @@ class GridView(tk.Frame):
                           font=HFONT, width=HDR_W - 2)
         # 左上コーナー
         c.create_rectangle(0, 0, HDR_W, HDR_H, fill="#dfe4ea", outline=GRID_LINE)
-        c.create_text(HDR_W / 2, HDR_H / 2,
-                      text=("左" if self.side == "left" else "右"), font=HFONT)
+        c.create_text(HDR_W / 2, HDR_H / 2, text=SIDE_LABELS[self.side],
+                      font=HFONT)
 
     def _kind_mark(self, pair) -> str:
         """行対応種別の簡易マーク。"""
-        if pair.manual and pair.left is not None and pair.right is not None:
+        if pair.manual and len(pair.present()) >= 2:
             return "🔗"
         return ""
 
@@ -392,9 +392,8 @@ class GridView(tk.Frame):
         c.configure(scrollregion=(0, 0, hdr_w + cw, max(total, 1)))
 
         sel = app.selection
-        same = app.same_left if self.side == "left" else app.same_right
-        rowsel = (app.left_sel_row if self.side == "left"
-                  else app.right_sel_row)
+        same = app.same[self.side]
+        rowsel = app.sel_rows[self.side]
 
         for i in range(nd):
             y = app.single_offsets[i]
@@ -434,8 +433,8 @@ class GridView(tk.Frame):
                       text=app.single_col_header_label(), font=HFONT)
         # 左上コーナー
         c.create_rectangle(0, 0, hdr_w, HDR_H, fill="#dfe4ea", outline=GRID_LINE)
-        c.create_text(hdr_w / 2, HDR_H / 2,
-                      text=("左" if self.side == "left" else "右"), font=HFONT)
+        c.create_text(hdr_w / 2, HDR_H / 2, text=SIDE_LABELS[self.side],
+                      font=HFONT)
 
 
 def _bg_for(state: str) -> str:
